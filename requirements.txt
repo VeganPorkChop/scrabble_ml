@@ -1,0 +1,9 @@
+# Core ML
+# Install PyTorch from https://pytorch.org/get-started/locally/
+# for your platform (CPU-only or CUDA).  Example for CPU:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Example for CUDA 12.1:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+
+# No other external dependencies — the engine is pure Python + PyTorch.

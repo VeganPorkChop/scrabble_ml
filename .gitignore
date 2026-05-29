@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# GADDAG cache — rebuild with: python -c "from gaddag import GADDAG; GADDAG.load_or_build('TWL06.txt')"
+gaddag.pkl
+
+# Dictionary file — download TWL06.txt separately
+# (too large and has its own license; users download it themselves)
+TWL06.txt
+
+# Checkpoints — commit these if you want to continue training on another machine
+# Uncomment the line below to EXCLUDE them instead:
+# checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code internal files
+.claude/
