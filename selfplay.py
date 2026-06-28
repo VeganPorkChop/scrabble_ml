@@ -136,14 +136,15 @@ def play_game(
             # This is ~100x faster than calling score_move() in a loop because
             # PyTorch processes the whole batch on the GPU/CPU in parallel.
             model.eval()
+            device = next(model.parameters()).device  # wherever the model lives (CPU or GPU)
             with torch.no_grad():
                 move_feats = torch.stack([
                     move_features(m, rack, len(bag), board) for m in moves
-                ])                                      # [N_moves, N_MOVE_FEATURES]
+                ]).to(device)                           # [N_moves, N_MOVE_FEATURES]
                 n = len(moves)
-                boards_b = board_t.unsqueeze(0).expand(n, -1, -1, -1)  # [N, 27, 15, 15]
-                racks_b  = rack_t.unsqueeze(0).expand(n, -1)            # [N, 27]
-                vals = model(boards_b, racks_b, move_feats).squeeze(1)  # [N]
+                boards_b = board_t.unsqueeze(0).expand(n, -1, -1, -1).to(device)  # [N, 27, 15, 15]
+                racks_b  = rack_t.unsqueeze(0).expand(n, -1).to(device)            # [N, 27]
+                vals = model(boards_b, racks_b, move_feats).squeeze(1)             # [N]
             best_idx  = vals.argmax().item()
             chosen    = moves[best_idx]
         else:

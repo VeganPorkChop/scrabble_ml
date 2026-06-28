@@ -72,10 +72,11 @@ def ai_choose(board: Board, rack: list[str], bag: Bag,
 
     # Neural network: batch-evaluate all candidates
     model.eval()
-    board_t = board_to_tensor(board)
-    rack_t  = rack_to_tensor(rack)
+    device  = next(model.parameters()).device
+    board_t = board_to_tensor(board).to(device)
+    rack_t  = rack_to_tensor(rack).to(device)
     with torch.no_grad():
-        move_feats = torch.stack([move_features(m, rack, len(bag), board) for m in moves])
+        move_feats = torch.stack([move_features(m, rack, len(bag), board) for m in moves]).to(device)
         n = len(moves)
         boards_b = board_t.unsqueeze(0).expand(n, -1, -1, -1)
         racks_b  = rack_t.unsqueeze(0).expand(n, -1)

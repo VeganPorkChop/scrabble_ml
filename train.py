@@ -6,7 +6,7 @@ Overview
 We use a replay buffer — a fixed-size pool of ExperienceTuples.  Each
 training iteration:
 
-  1. Play N self-play games to generate new experience.
+  1. Play N self-play games IN PARALLEL across CPU cores.
   2. Add experience to the replay buffer (oldest entries dropped when full).
   3. Sample a random minibatch from the buffer.
   4. Compute MSE loss between model prediction and discounted target.
@@ -14,36 +14,41 @@ training iteration:
   6. Decay epsilon (less exploration over time).
   7. Save a checkpoint every K iterations.
 
+Why parallel self-play?
+────────────────────────
+The bottleneck is NOT the GPU — it's the Python move generator (GADDAG
+traversal) running on CPU.  A single game takes ~10-20 seconds.  With 16
+CPU cores we can play 16 games simultaneously, cutting wall-clock time by
+~10x for the self-play phase.
+
+We use a persistent ProcessPoolExecutor with an initializer that loads
+the GADDAG once per worker process.  Reloading it for every game would
+cost 7 seconds each time — instead it's a one-time ~7s startup cost per
+worker, then near-instant lookups afterward.
+
+The model weights (372KB) are pickled and sent to workers each iteration
+so workers can do epsilon-greedy exploitation on CPU.  The main process
+keeps the GPU model for training.
+
 Replay buffer
 ─────────────
 Why not just train on the most recent games?
   Recent games come from a correlated sequence of states.  Training on
-  correlated data causes the network to forget earlier patterns (catastrophic
-  forgetting).  Sampling randomly from a large buffer breaks the correlation,
-  which stabilises training — this was a key insight in DeepMind's DQN (2015).
+  correlated data causes the network to forget earlier patterns
+  (catastrophic forgetting).  Sampling randomly from a large buffer
+  breaks the correlation — a key insight from DeepMind's DQN (2015).
 
-Loss function: MSE
-──────────────────
-Our target is a continuous scalar (score margin), so Mean Squared Error is
-the natural choice.  If we were classifying moves as "good/bad" we'd use
-cross-entropy, but regression with MSE fits what we're doing.
-
-Adam optimiser
-──────────────
-Stochastic Gradient Descent (SGD) + momentum + per-parameter learning rates.
-Adam almost always converges faster than plain SGD on problems like this.
-lr=1e-3 is a standard starting point; we add weight_decay (L2 regularisation)
-to prevent overfitting when experience is limited.
-
-Run:  python train.py
-      python train.py --iterations 200 --games-per-iter 20 --batch-size 256
+Loss: MSE.  Adam optimiser with weight decay (L2 regularisation).
 """
 
 import argparse
 import collections
+import multiprocessing
+import os
 import random
 import time
 import pathlib
+from concurrent.futures import ProcessPoolExecutor
 
 import torch
 import torch.nn as nn
@@ -53,50 +58,90 @@ from gaddag import GADDAG
 from model import ScrabbleNet
 from selfplay import play_game, ExperienceTuple
 
-# ── Defaults ─────────────────────────────────────────────────────────────────
+# ── Defaults ──────────────────────────────────────────────────────────────────
 
-DICT_PATH     = "TWL06.txt"
-CACHE_PATH    = "gaddag.pkl"
+DICT_PATH      = "TWL06.txt"
+CACHE_PATH     = "gaddag.pkl"
 CHECKPOINT_DIR = pathlib.Path("checkpoints")
 
-BUFFER_SIZE     = 50_000   # max experience tuples in replay buffer
-BATCH_SIZE      = 256
-LEARNING_RATE   = 1e-3
-WEIGHT_DECAY    = 1e-4
-GAMES_PER_ITER  = 10       # self-play games generated per training iteration
-TRAIN_STEPS     = 4        # gradient steps per iteration
-ITERATIONS      = 100
-EPSILON_START   = 1.0
-EPSILON_END     = 0.05
-SAVE_EVERY      = 10       # save checkpoint every N iterations
+BUFFER_SIZE    = 50_000
+BATCH_SIZE     = 256
+LEARNING_RATE  = 1e-3
+WEIGHT_DECAY   = 1e-4
+GAMES_PER_ITER = 16      # should be a multiple of NUM_WORKERS
+TRAIN_STEPS    = 4
+ITERATIONS     = 100
+EPSILON_START  = 1.0
+EPSILON_END    = 0.05
+SAVE_EVERY     = 10
+NUM_WORKERS    = max(1, min(8, (os.cpu_count() or 4) - 2))  # leave 2 cores free
 
+
+# ── Worker process setup ──────────────────────────────────────────────────────
+# These must be module-level (not nested) so Python's 'spawn' start method
+# can pickle them on Windows.
+
+_worker_gaddag = None  # loaded once per worker process, lives in global
+
+def _worker_init(cache_path: str) -> None:
+    """Called once when each worker process starts.  Loads the GADDAG into a
+    module-level global so it's reused across all games this worker plays."""
+    global _worker_gaddag
+    _worker_gaddag = GADDAG.load(cache_path)
+
+
+def _worker_play(args: tuple) -> list:
+    """Play one game and return a list of ExperienceTuples (as plain dicts so
+    they survive the pickle round-trip back to the main process)."""
+    epsilon, seed, model_state_cpu = args
+
+    model = None
+    if model_state_cpu is not None:
+        m = ScrabbleNet()          # CPU model inside the worker
+        m.load_state_dict(model_state_cpu)
+        m.eval()
+        model = m
+
+    tuples = play_game(_worker_gaddag, model=model, epsilon=epsilon, seed=seed)
+
+    # Tensors inside ExperienceTuple survive pickle fine, but we share them
+    # as plain Python lists to avoid any PyTorch multiprocessing quirks.
+    return [
+        (t.board_t, t.rack_t, t.move_f, t.target)
+        for t in tuples
+    ]
+
+
+# ── Batch builder ─────────────────────────────────────────────────────────────
 
 def build_batch(
     samples: list[ExperienceTuple],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Stack a list of ExperienceTuples into GPU-ready batched tensors."""
     boards  = torch.stack([s.board_t for s in samples]).to(device)
     racks   = torch.stack([s.rack_t  for s in samples]).to(device)
     moves   = torch.stack([s.move_f  for s in samples]).to(device)
-    targets = torch.tensor([s.target for s in samples],
-                           dtype=torch.float32, device=device).unsqueeze(1)
+    targets = torch.tensor(
+        [s.target for s in samples], dtype=torch.float32, device=device
+    ).unsqueeze(1)
     return boards, racks, moves, targets
 
+
+# ── Main training loop ────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"CPU workers for self-play: {args.workers}")
 
-    # ── Load dictionary ───────────────────────────────────────────────
-    gaddag = GADDAG.load_or_build(args.dict, args.cache)
-    print(f"Dictionary loaded.  Testing: QUETZAL={gaddag.contains('QUETZAL')}")
+    # ── Load dictionary (main process only — workers load from cache) ──
+    GADDAG.load_or_build(args.dict, args.cache)   # ensures cache exists
+    print(f"Dictionary ready.")
 
     # ── Model + optimiser ─────────────────────────────────────────────
     model = ScrabbleNet().to(device)
     print(f"ScrabbleNet parameters: {model.parameter_count():,}")
 
-    # Load checkpoint if resuming
     CHECKPOINT_DIR.mkdir(exist_ok=True)
     start_iter = 0
     latest = sorted(CHECKPOINT_DIR.glob("ckpt_*.pt"))
@@ -109,80 +154,96 @@ def train(args: argparse.Namespace) -> None:
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     loss_fn   = nn.MSELoss()
 
-    # ── Replay buffer ─────────────────────────────────────────────────
     buffer: collections.deque[ExperienceTuple] = collections.deque(maxlen=args.buffer)
 
-    # ── Epsilon schedule ──────────────────────────────────────────────
-    # Linear decay from EPSILON_START to EPSILON_END over all iterations
-    def epsilon_at(iteration: int) -> float:
-        frac = min(iteration / max(args.iterations - 1, 1), 1.0)
+    def epsilon_at(it: int) -> float:
+        frac = min(it / max(args.iterations - 1, 1), 1.0)
         return EPSILON_START + frac * (EPSILON_END - EPSILON_START)
 
-    # ── Training loop ─────────────────────────────────────────────────
     loss_history: list[float] = []
 
-    for it in range(start_iter, start_iter + args.iterations):
-        eps = epsilon_at(it - start_iter)
-        t0  = time.time()
+    # ── Spawn worker pool (GADDAG loads once per worker here) ─────────
+    print(f"Starting {args.workers} worker processes (loading GADDAG, ~7s each)...")
+    with ProcessPoolExecutor(
+        max_workers=args.workers,
+        initializer=_worker_init,
+        initargs=(args.cache,),
+    ) as pool:
+        print("Workers ready.\n")
 
-        # 1. Generate self-play experience
-        new_exp = 0
-        for _ in range(args.games_per_iter):
-            tuples = play_game(gaddag, model=model, epsilon=eps)
-            buffer.extend(tuples)
-            new_exp += len(tuples)
+        for it in range(start_iter, start_iter + args.iterations):
+            eps = epsilon_at(it - start_iter)
+            t0  = time.time()
 
-        # 2. Train (only once we have enough data for a batch)
-        iter_losses: list[float] = []
-        if len(buffer) >= args.batch_size:
-            model.train()
-            for _ in range(args.train_steps):
-                samples = random.sample(list(buffer), args.batch_size)
-                boards, racks, moves, targets = build_batch(samples, device)
+            # 1. Self-play — all games run in parallel across workers
+            #    Pass CPU copy of model weights so workers can do exploitation
+            model_cpu_state = {k: v.cpu() for k, v in model.state_dict().items()} \
+                              if eps < 0.99 else None
 
-                preds = model(boards, racks, moves)
-                loss  = loss_fn(preds, targets)
+            seeds = [it * 1000 + g for g in range(args.games_per_iter)]
+            task_args = [(eps, s, model_cpu_state) for s in seeds]
 
-                optimizer.zero_grad()
-                loss.backward()
-                # Gradient clipping — prevents exploding gradients
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+            new_exp = 0
+            for raw_tuples in pool.map(_worker_play, task_args):
+                for board_t, rack_t, move_f, target in raw_tuples:
+                    buffer.append(ExperienceTuple(board_t, rack_t, move_f, target))
+                    new_exp += 1
 
-                iter_losses.append(loss.item())
+            t_selfplay = time.time() - t0
 
-        avg_loss = sum(iter_losses) / len(iter_losses) if iter_losses else float("nan")
-        loss_history.append(avg_loss)
-        elapsed = time.time() - t0
+            # 2. Train on GPU
+            iter_losses: list[float] = []
+            if len(buffer) >= args.batch_size:
+                model.train()
+                for _ in range(args.train_steps):
+                    samples = random.sample(list(buffer), args.batch_size)
+                    boards, racks, moves, targets = build_batch(samples, device)
 
-        print(
-            f"[iter {it+1:04d}]  eps={eps:.3f}  "
-            f"buf={len(buffer):>6,}  +exp={new_exp:>4}  "
-            f"loss={avg_loss:.4f}  ({elapsed:.1f}s)"
-        )
+                    preds = model(boards, racks, moves)
+                    loss  = loss_fn(preds, targets)
 
-        # 3. Save checkpoint
-        if (it + 1) % args.save_every == 0:
-            ckpt_path = CHECKPOINT_DIR / f"ckpt_{it+1:04d}.pt"
-            torch.save({"model": model.state_dict(), "iteration": it + 1}, ckpt_path)
-            print(f"  Checkpoint saved: {ckpt_path}")
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                    iter_losses.append(loss.item())
+
+            avg_loss = sum(iter_losses) / len(iter_losses) if iter_losses else float("nan")
+            loss_history.append(avg_loss)
+            elapsed = time.time() - t0
+
+            print(
+                f"[iter {it+1:04d}]  eps={eps:.3f}  "
+                f"buf={len(buffer):>6,}  +exp={new_exp:>4}  "
+                f"loss={avg_loss:.4f}  "
+                f"(selfplay {t_selfplay:.1f}s  total {elapsed:.1f}s)"
+            )
+
+            # 3. Save checkpoint
+            if (it + 1) % args.save_every == 0:
+                ckpt_path = CHECKPOINT_DIR / f"ckpt_{it+1:04d}.pt"
+                torch.save({"model": model.state_dict(), "iteration": it + 1}, ckpt_path)
+                print(f"  Checkpoint saved: {ckpt_path}")
 
     print("\nTraining complete.")
-
-    # ── Save final model ──────────────────────────────────────────────
     final_path = CHECKPOINT_DIR / "model_final.pt"
     torch.save({"model": model.state_dict(), "iteration": start_iter + args.iterations}, final_path)
     print(f"Final model saved to {final_path}")
 
-    # ── Print simple loss summary ─────────────────────────────────────
-    valid = [l for l in loss_history if l == l]  # filter NaN
-    if valid:
+    valid = [l for l in loss_history if l == l]
+    if len(valid) >= 2:
         n = len(valid)
-        first_q = valid[:n // 4]
-        last_q  = valid[-(n // 4) or 1:]
-        print(f"\nLoss summary:")
+        split = max(1, n // 4)
+        first_q, last_q = valid[:split], valid[-split:]
+        print(f"\nLoss summary ({n} iters with data):")
         print(f"  First quarter avg : {sum(first_q)/len(first_q):.4f}")
         print(f"  Last quarter avg  : {sum(last_q)/len(last_q):.4f}")
+    elif len(valid) == 1:
+        print(f"\nLoss (1 training iter): {valid[0]:.4f}")
+    else:
+        print("\nNo training — buffer never reached batch size.")
+        print(f"  Try --batch-size {min(64, BATCH_SIZE)}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -198,11 +259,12 @@ def main() -> None:
     parser.add_argument("--lr",             type=float, default=LEARNING_RATE)
     parser.add_argument("--save-every",     type=int,   default=SAVE_EVERY,      dest="save_every")
     parser.add_argument("--train-steps",    type=int,   default=TRAIN_STEPS,     dest="train_steps")
-    parser.add_argument("--fresh",          action="store_true",
-                        help="Ignore existing checkpoints and start fresh.")
+    parser.add_argument("--workers",        type=int,   default=NUM_WORKERS)
+    parser.add_argument("--fresh",          action="store_true")
     args = parser.parse_args()
     train(args)
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()   # needed for Windows frozen executables
     main()

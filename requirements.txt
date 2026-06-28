@@ -6,4 +6,7 @@
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 torch>=2.0.0
 
+# GUI
+pygame>=2.0.0
+
 # No other external dependencies — the engine is pure Python + PyTorch.
